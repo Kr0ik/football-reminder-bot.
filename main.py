@@ -115,7 +115,6 @@ def send_notifications():
     
     text = ''.join(text_parts)
         print(text)
-    bot.send_message(CHAT_ID, text)
-
+        bot.send_message(CHAT_ID, text)
 if __name__ == "__main__":
     send_notifications()
