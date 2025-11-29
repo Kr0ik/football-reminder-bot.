@@ -4,13 +4,6 @@ from bs4 import BeautifulSoup
 import telebot
 import re
 from datetime import datetime, timedelta
-import locale
-
-# Попытка установить русскую локаль для дат (если система поддерживает)
-try:
-    locale.setlocale(locale.LC_ALL, 'ru_RU.UTF-8')
-except:
-    pass
 
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 CHAT_ID = os.environ["CHAT_ID"]
@@ -36,71 +29,79 @@ def get_upcoming_matches(url, team_name):
         today = datetime.now()
         week_later = today + timedelta(days=7)
         
-        # Ищем таблицу с календарем
-        table = soup.find('table')
-        if not table:
-            print(f"Таблица не найдена для {team_name}")
-            return []
+        # Новый подход: ищем ссылки с будущими матчами
+        # Будущие матчи имеют формат "Команда А – Команда Б - : -"
+        all_links = soup.find_all('a')
+        print(f"Найдено ссылок: {len(all_links)}")
         
-        rows = table.find_all('tr')
-        print(f"Найдено строк: {len(rows)}")
+        # Словарь для хранения дат по href
+        date_map = {}
+        match_map = {}
         
-        for row in rows:
-            cells = row.find_all('td')
-            if len(cells) < 5:
-                continue  # Пропускаем заголовки
+        for link in all_links:
+            href = link.get('href', '')
+            text = link.get_text(strip=True)
             
-            # Проверяем, есть ли признак будущего матча
-            row_text = row.get_text().lower()
-            is_upcoming = ('превью' in row_text) or ('- : -' in row_text)
+            # Ищем ссылки с датами (формат DD.MM.YYYY|HH:MM)
+            date_match = re.search(r'(\d{2})\.(\d{2})\.(\d{4})\|(\d{2}:\d{2})', text)
+            if date_match:
+                day, month, year, time = date_match.groups()
+                date_map[href] = f"{day}.{month}.{year} {time}"
             
-            if not is_upcoming:
+            # Ищем ссылки с будущими матчами (содержат " – " и "- : -")
+            if ' – ' in text and '- : -' in text:
+                # Убираем счет из названия
+                match_title = text.replace(' - : -', '').strip()
+                match_map[href] = match_title
+                print(f"Найден будущий матч: {match_title} (href: {href})")
+        
+        # Теперь сопоставляем матчи с датами
+        for href, match_title in match_map.items():
+            # Ищем дату для этого матча
+            date_str = None
+            
+            # Пробуем найти по части href
+            for date_href, date_val in date_map.items():
+                # Проверяем совпадение по дате в href
+                if '/football/match/' in href:
+                    match_date_part = href.split('/')[-2] if href.endswith('/') else href.split('/')[-1]
+                    if match_date_part in date_href or date_href in href:
+                        date_str = date_val
+                        break
+            
+            # Если не нашли по href, ищем дату из текста страницы
+            if not date_str:
+                # Ищем в HTML рядом с матчем
+                match_link = soup.find('a', href=href)
+                if match_link:
+                    parent = match_link.parent
+                    if parent:
+                        parent_text = parent.get_text()
+                        date_search = re.search(r'(\d{2})\.(\d{2})\.(\d{4}).*?(\d{2}:\d{2})', parent_text)
+                        if date_search:
+                            day, month, year, time = date_search.groups()
+                            date_str = f"{day}.{month}.{year} {time}"
+            
+            if not date_str:
+                print(f"  Не найдена дата для матча: {match_title}")
                 continue
             
-            # DEBUG: выводим содержимое ячеек
-            print(f"\n--- Найден будущий матч ---")
-            for i, cell in enumerate(cells):
-                print(f"  Cell[{i}]: {cell.get_text(strip=True)[:50]}")
+            print(f"  Дата: {date_str}")
             
-            # Ячейка 0: Дата и время (формат "DD.MM.YYYY|HH:MM")
-            date_cell = cells[0].get_text(strip=True)
-            date_match = re.search(r'(\d{2})\.(\d{2})\.(\d{4}).*?(\d{2}:\d{2})', date_cell)
-            
-            if not date_match:
-                print(f"  Дата не распознана: {date_cell}")
+            # Парсим дату
+            try:
+                dt_msk = datetime.strptime(date_str, "%d.%m.%Y %H:%M")
+            except:
+                print(f"  Ошибка парсинга даты: {date_str}")
                 continue
             
-            day, month, year, time = date_match.groups()
-            dt_msk = datetime.strptime(f"{day}.{month}.{year} {time}", "%d.%m.%Y %H:%M")
-            
-            # Проверяем, попадает ли матч в ближайшие 7 дней
+            # Проверяем диапазон
             if not (today <= dt_msk <= week_later):
-                print(f"  Матч {dt_msk} не в диапазоне {today} - {week_later}")
+                print(f"  Матч не в диапазоне 7 дней")
                 continue
             
-            # КОНВЕРТАЦИЯ ВРЕМЕНИ (Москва UTC+3 -> Израиль UTC+2 зимой)
+            # Конвертация времени (Москва UTC+3 -> Израиль UTC+2)
             dt_il = dt_msk - timedelta(hours=1)
-            
-            # Ячейка 2: Соперник (название команды)
-            opponent = cells[2].get_text(strip=True) if len(cells) > 2 else "?"
-            
-            # Ищем полное название матча в последних ячейках
-            # Обычно это ячейка с текстом типа "Команда А – Команда Б - : -"
-            match_title = ""
-            for cell in reversed(cells):
-                cell_text = cell.get_text(strip=True)
-                if ' – ' in cell_text and len(cell_text) > 10:
-                    # Убираем счет из названия
-                    match_title = re.sub(r'\s*-\s*:\s*-\s*$', '', cell_text).strip()
-                    match_title = re.sub(r'\s*\d+\s*:\s*\d+\s*$', '', match_title).strip()
-                    break
-            
-            # Если не нашли полное название, формируем из соперника
-            if not match_title:
-                match_title = f"vs {opponent}"
-            
-            print(f"  Match title: {match_title}")
-            print(f"  Date (MSK): {dt_msk}, Date (IL): {dt_il}")
             
             # Форматирование
             months_ru = ['января', 'февраля', 'марта', 'апреля', 'мая', 'июня',
@@ -116,8 +117,9 @@ def get_upcoming_matches(url, team_name):
                 f"⚽ {match_title}"
             )
             matches.append(entry)
+            print(f"  ✓ Добавлен матч")
         
-        print(f"\nВсего найдено матчей для {team_name}: {len(matches)}")
+        print(f"Всего матчей для {team_name}: {len(matches)}")
         return matches
     except Exception as e:
         print(f"Error fetching {team_name}: {e}")
@@ -146,16 +148,15 @@ def send_notifications():
     
     text = ''.join(text_parts)
     
-    print(f"\n=== ИТОГОВОЕ СООБЩЕНИЕ ===")
+    print(f"\n=== СООБЩЕНИЕ ===")
     print(text)
-    print("=========================\n")
+    print("================\n")
     
-    # Отправка с parse_mode='HTML' для жирного текста
     try:
         bot.send_message(CHAT_ID, text, parse_mode='HTML', disable_web_page_preview=True)
         print("Сообщение отправлено!")
     except Exception as e:
-        print(f"Ошибка отправки Telegram: {e}")
+        print(f"Ошибка отправки: {e}")
 
 if __name__ == "__main__":
     send_notifications()
