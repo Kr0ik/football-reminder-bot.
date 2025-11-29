@@ -3,14 +3,15 @@ import requests
 from bs4 import BeautifulSoup
 import telebot
 import re
-from datetime import datetime, timedelta
+from datetime import datetime
 
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 CHAT_ID = os.environ["CHAT_ID"]
 bot = telebot.TeleBot(TELEGRAM_TOKEN)
 
-# Days of week in Russian
-DAYS_RU = ["Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Суббота", "Воскресенье"]
+# URLs for team calendars on sports.ru
+MANU_URL = "https://www.sports.ru/football/club/mu/calendar/"
+CSKA_URL = "https://www.sports.ru/football/club/cska/calendar/"
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -20,9 +21,11 @@ HEADERS = {
 def convert_to_jerusalem_time(time_str):
     """Convert Moscow time (UTC+3) to Jerusalem time (UTC+2 in winter)"""
     try:
-        time_str = time_str.replace('.', ':')
+        time_str = time_str.replace('.', ':').strip()
         if ':' in time_str:
-            hours, minutes = map(int, time_str.split(':'))
+            parts = time_str.split(':')
+            hours = int(parts[0])
+            minutes = int(parts[1]) if len(parts) > 1 else 0
             hours = hours - 1  # Moscow UTC+3 to Jerusalem UTC+2 (winter)
             if hours < 0:
                 hours = 23
@@ -31,82 +34,84 @@ def convert_to_jerusalem_time(time_str):
         pass
     return time_str
 
-def find_matches_for_week():
-    """Find matches for next 7 days"""
-    manu_matches = []
-    cska_matches = []
-    
-    for day_offset in range(8):
-        check_date = datetime.now() + timedelta(days=day_offset)
-        date_str = check_date.strftime("%Y-%m-%d")
-        day_name = DAYS_RU[check_date.weekday()]
-        formatted_date = check_date.strftime("%d.%m.%Y")
+def get_upcoming_matches(url, team_name):
+    """Get upcoming matches from sports.ru calendar page"""
+    matches = []
+    try:
+        resp = requests.get(url, headers=HEADERS, timeout=30)
+        resp.raise_for_status()
+        soup = BeautifulSoup(resp.text, 'html.parser')
         
-        url = f"https://www.championat.com/stat/#{date_str}"
+        # Find match blocks - looking for upcoming matches (no score yet)
+        # Format on sports.ru: date time, teams, league
+        text = soup.get_text(separator='\n')
+        lines = text.split('\n')
         
-        try:
-            resp = requests.get("https://www.championat.com/stat/", headers=HEADERS, timeout=30)
-            resp.raise_for_status()
-            soup = BeautifulSoup(resp.text, 'html.parser')
-            html_lower = resp.text.lower()
+        for i, line in enumerate(lines):
+            line = line.strip()
+            # Look for date patterns like "30 ноября" or "07 декабря"
+            date_match = re.search(r'(\d{1,2})\s+(января|февраля|марта|апреля|мая|июня|июля|августа|сентября|октября|ноября|декабря)\s+(\d{1,2}:\d{2})', line)
             
-            # Search for Manchester United
-            manu_patterns = ["манчестер юнайтед", "манчестер ю."]
-            for pattern in manu_patterns:
-                if pattern in html_lower:
-                    # Find all lines with time and match info
-                    matches = re.findall(r'(\d{1,2}[:\.:]\d{2})\s*([^<]{10,100}' + re.escape(pattern) + r'[^<]{0,50})', html_lower)
-                    matches += re.findall(r'(\d{1,2}[:\.:]\d{2})\s*([^<]{0,50}' + re.escape(pattern) + r'[^<]{10,100})', html_lower)
-                    
-                    for time_str, match_text in matches:
-                        jerusalem_time = convert_to_jerusalem_time(time_str)
-                        clean_match = ' '.join(match_text.split())[:100]
-                        entry = f"📅 {formatted_date} ({day_name})\n⏰ {jerusalem_time} (Иерусалим)\n⚽ {clean_match.title()}"
-                        if entry not in manu_matches and "манчестер" in entry.lower():
-                            manu_matches.append(entry)
-            
-            # Search for CSKA Moscow only (in context of Russian league)
-            # Look for CSKA in Russian Premier League section
-            if "российская премьер-лига" in html_lower or "мир российская" in html_lower:
-                # Only CSKA in Russian league context
-                cska_pattern = r'(\d{1,2}[:\.:]\d{2})\s*([^<]{0,50}цска[^<]{0,50})'
-                matches = re.findall(cska_pattern, html_lower)
+            if date_match:
+                day = date_match.group(1)
+                month = date_match.group(2)
+                time_msk = date_match.group(3)
+                time_jer = convert_to_jerusalem_time(time_msk)
                 
-                for time_str, match_text in matches:
-                    # Exclude other CSKAs (Sofia, etc)
-                    if 'софия' in match_text.lower() or 'болгар' in match_text.lower():
-                        continue
-                    jerusalem_time = convert_to_jerusalem_time(time_str)
-                    clean_match = ' '.join(match_text.split())[:100]
-                    entry = f"📅 {formatted_date} ({day_name})\n⏰ {jerusalem_time} (Иерусалим)\n⚽ {clean_match.title()}"
-                    if entry not in cska_matches:
-                        cska_matches.append(entry)
-            
-            break  # Page contains all days
-            
-        except Exception as e:
-            continue
+                # Look for match info in nearby lines
+                match_info = ""
+                for j in range(max(0, i-2), min(len(lines), i+5)):
+                    check_line = lines[j].strip()
+                    if '–' in check_line or '-' in check_line:
+                        if len(check_line) > 5 and len(check_line) < 100:
+                            match_info = check_line
+                            break
+                
+                if match_info:
+                    # Check if match is not completed (no score like "2 0" or "2:0")
+                    if not re.search(r'\d\s*[:–-]?\s*\d\s*$', match_info) or 'заверш' not in line.lower():
+                        entry = f"📅 {day} {month}\n⏰ {time_jer} (Иерусалим)\n⚽ {match_info}"
+                        if entry not in matches:
+                            matches.append(entry)
+        
+        # Also try to find future matches by looking for specific patterns
+        # Pattern: "Team1 – Team2" followed by date
+        all_text = soup.get_text()
+        
+        # Find patterns like "30 ноября 15:00"
+        future_matches = re.findall(r'(\d{1,2})\s+(января|февраля|марта|апреля|мая|июня|июля|августа|сентября|октября|ноября|декабря)\s+(\d{1,2}:\d{2})\s*([^\n]{10,80})', all_text)
+        
+        for day, month, time_msk, match_text in future_matches:
+            if 'заверш' not in match_text.lower():
+                time_jer = convert_to_jerusalem_time(time_msk)
+                entry = f"📅 {day} {month}\n⏰ {time_jer} (Иерусалим)\n⚽ {match_text.strip()}"
+                if entry not in matches and team_name.lower() in entry.lower():
+                    matches.append(entry)
+        
+    except Exception as e:
+        matches.append(f"Ошибка: {str(e)[:50]}")
     
-    return manu_matches[:5], cska_matches[:5]
+    return matches[:5]
 
 def send_notifications():
-    manu_matches, cska_matches = find_matches_for_week()
+    manu_matches = get_upcoming_matches(MANU_URL, "Манчестер")
+    cska_matches = get_upcoming_matches(CSKA_URL, "ЦСКА")
     
     text_parts = ["🏆 Напоминание о матчах на неделю:\n"]
     
+    text_parts.append("\n🔴 Манчестер Юнайтед:\n")
     if manu_matches:
-        text_parts.append("\n🔴 Манчестер Юнайтед:\n")
-        text_parts.extend([f"\n{m}\n" for m in manu_matches])
+        text_parts.extend([f"{m}\n" for m in manu_matches])
     else:
-        text_parts.append("\n🔴 Манчестер Юнайтед: нет матчей на этой неделе\n")
+        text_parts.append("Нет матчей на этой неделе\n")
     
+    text_parts.append("\n🔵 ЦСКА Москва:\n")
     if cska_matches:
-        text_parts.append("\n🔵 ЦСКА Москва:\n")
-        text_parts.extend([f"\n{m}\n" for m in cska_matches])
+        text_parts.extend([f"{m}\n" for m in cska_matches])
     else:
-        text_parts.append("\n🔵 ЦСКА Москва: нет матчей на этой неделе\n")
+        text_parts.append("Нет матчей на этой неделе\n")
     
-    text_parts.append("\n🔗 https://www.championat.com/stat/")
+    text_parts.append("\n🔗 sports.ru")
     
     text = ''.join(text_parts)
     bot.send_message(CHAT_ID, text)
