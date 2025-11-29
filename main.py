@@ -25,60 +25,6 @@ HEADERS = {
     "Accept-Language": "ru-RU,ru;q=0.9"
 }
 
-def get_match_details(row_cells, year_from_url=None):
-    """
-    Извлекает данные из ячеек строки таблицы.
-    Возвращает: datetime_msk, match_title
-    """
-    try:
-        # 1. Дата и время (1-я колонка)
-        # Формат обычно: "30.11.2025 | 15:00" или "30.11.2025\n15:00"
-        date_text = row_cells[0].get_text(strip=True)
-        # Ищем паттерн ДД.ММ.ГГГГ и ЧЧ:ММ
-        date_match = re.search(r'(\d{2})\.(\d{2})\.(\d{4}).*?(\d{2}:\d{2})', date_text)
-        
-        if not date_match:
-            return None, None
-
-        day, month, year, time = date_match.groups()
-        dt_msk = datetime.strptime(f"{day}.{month}.{year} {time}", "%d.%m.%Y %H:%M")
-
-        # 2. Название матча (обычно в колонке "Счет" - это ссылка)
-        # Структура sports.ru: Дата | Турнир | Соперник | Счет/Превью
-        # Иногда колонок 5, иногда 4. Счет/Ссылка обычно предпоследняя или последняя.
-        
-        match_title = ""
-        
-        # Ищем ячейку со счетом/ссылкой (обычно содержит "превью" или "- : -")
-        score_cell = None
-        for cell in row_cells:
-            if '- : -' in cell.get_text() or 'превью' in cell.get_text().lower() or ':' in cell.get_text():
-                 score_cell = cell
-                 
-        # Если не нашли явную ячейку счета, берем последнюю
-        if not score_cell:
-            score_cell = row_cells[-1]
-
-        # Пытаемся достать текст ссылки (там обычно "Команда А – Команда Б")
-        link = score_cell.find('a')
-        if link:
-            match_title = link.get_text(strip=True)
-        
-        # Если ссылки нет или текст пустой, формируем из названия соперника
-        if not match_title or match_title == "- : -":
-            # Обычно соперник в 3-й колонке (индекс 2)
-            opponent = row_cells[2].get_text(strip=True)
-            match_title = f"vs {opponent}"
-
-        # Очистка названия от мусора (счета типа "- : -")
-        match_title = match_title.replace("- : -", "").strip()
-        
-        return dt_msk, match_title
-
-    except Exception as e:
-        print(f"Error parsing row: {e}")
-        return None, None
-
 def get_upcoming_matches(url, team_name):
     print(f"Загрузка {team_name}...")
     try:
@@ -89,60 +35,94 @@ def get_upcoming_matches(url, team_name):
         matches = []
         today = datetime.now()
         week_later = today + timedelta(days=7)
-
-        # Ищем таблицу со статистикой (стандарт sports.ru)
-        table = soup.find('table', class_='stat-table')
+        
+        # Ищем таблицу с календарем
+        table = soup.find('table')
         if not table:
-            # Fallback: ищем любую таблицу
-            table = soup.find('table')
-
-        if not table:
+            print(f"Таблица не найдена для {team_name}")
             return []
-
+        
         rows = table.find_all('tr')
+        print(f"Найдено строк: {len(rows)}")
         
         for row in rows:
             cells = row.find_all('td')
-            if len(cells) < 4: 
-                continue # Пропускаем заголовки
+            if len(cells) < 5:
+                continue  # Пропускаем заголовки
             
-            # Проверяем, есть ли признак будущего матча в строке
+            # Проверяем, есть ли признак будущего матча
             row_text = row.get_text().lower()
-            is_upcoming = ('- : -' in row_text) or ('превью' in row_text)
+            is_upcoming = ('превью' in row_text) or ('- : -' in row_text)
             
             if not is_upcoming:
                 continue
-
-            dt_msk, match_title = get_match_details(cells)
             
-            if dt_msk:
-                # Фильтр на 7 дней
-                if today <= dt_msk <= week_later:
-                    
-                    # КОНВЕРТАЦИЯ ВРЕМЕНИ (Москва UTC+3 -> Израиль UTC+2 зимой)
-                    # Вычитаем 1 час из datetime объекта
-                    # Это автоматически поправит дату, если время было 00:30
-                    dt_il = dt_msk - timedelta(hours=1)
-                    
-                    # Форматирование
-                    # Месяцы вручную, чтобы не зависеть от локали сервера
-                    months_ru = ['января', 'февраля', 'марта', 'апреля', 'мая', 'июня', 
-                                 'июля', 'августа', 'сентября', 'октября', 'ноября', 'декабря']
-                    
-                    day_str = dt_il.strftime("%d")
-                    month_str = months_ru[dt_il.month - 1]
-                    time_str = dt_il.strftime("%H:%M")
-                    
-                    entry = (
-                        f"📅 {day_str} {month_str}\n"
-                        f"🕐 {time_str} (Иерусалим)\n"
-                        f"⚽ {match_title}"
-                    )
-                    matches.append(entry)
-
+            # DEBUG: выводим содержимое ячеек
+            print(f"\n--- Найден будущий матч ---")
+            for i, cell in enumerate(cells):
+                print(f"  Cell[{i}]: {cell.get_text(strip=True)[:50]}")
+            
+            # Ячейка 0: Дата и время (формат "DD.MM.YYYY|HH:MM")
+            date_cell = cells[0].get_text(strip=True)
+            date_match = re.search(r'(\d{2})\.(\d{2})\.(\d{4}).*?(\d{2}:\d{2})', date_cell)
+            
+            if not date_match:
+                print(f"  Дата не распознана: {date_cell}")
+                continue
+            
+            day, month, year, time = date_match.groups()
+            dt_msk = datetime.strptime(f"{day}.{month}.{year} {time}", "%d.%m.%Y %H:%M")
+            
+            # Проверяем, попадает ли матч в ближайшие 7 дней
+            if not (today <= dt_msk <= week_later):
+                print(f"  Матч {dt_msk} не в диапазоне {today} - {week_later}")
+                continue
+            
+            # КОНВЕРТАЦИЯ ВРЕМЕНИ (Москва UTC+3 -> Израиль UTC+2 зимой)
+            dt_il = dt_msk - timedelta(hours=1)
+            
+            # Ячейка 2: Соперник (название команды)
+            opponent = cells[2].get_text(strip=True) if len(cells) > 2 else "?"
+            
+            # Ищем полное название матча в последних ячейках
+            # Обычно это ячейка с текстом типа "Команда А – Команда Б - : -"
+            match_title = ""
+            for cell in reversed(cells):
+                cell_text = cell.get_text(strip=True)
+                if ' – ' in cell_text and len(cell_text) > 10:
+                    # Убираем счет из названия
+                    match_title = re.sub(r'\s*-\s*:\s*-\s*$', '', cell_text).strip()
+                    match_title = re.sub(r'\s*\d+\s*:\s*\d+\s*$', '', match_title).strip()
+                    break
+            
+            # Если не нашли полное название, формируем из соперника
+            if not match_title:
+                match_title = f"vs {opponent}"
+            
+            print(f"  Match title: {match_title}")
+            print(f"  Date (MSK): {dt_msk}, Date (IL): {dt_il}")
+            
+            # Форматирование
+            months_ru = ['января', 'февраля', 'марта', 'апреля', 'мая', 'июня',
+                        'июля', 'августа', 'сентября', 'октября', 'ноября', 'декабря']
+            
+            day_str = dt_il.strftime("%d")
+            month_str = months_ru[dt_il.month - 1]
+            time_str = dt_il.strftime("%H:%M")
+            
+            entry = (
+                f"📅 {day_str} {month_str}\n"
+                f"🕐 {time_str} (Иерусалим)\n"
+                f"⚽ {match_title}"
+            )
+            matches.append(entry)
+        
+        print(f"\nВсего найдено матчей для {team_name}: {len(matches)}")
         return matches
     except Exception as e:
         print(f"Error fetching {team_name}: {e}")
+        import traceback
+        traceback.print_exc()
         return []
 
 def send_notifications():
@@ -152,7 +132,7 @@ def send_notifications():
     if not manu_matches and not cska_matches:
         print("Матчей на неделю нет, сообщение не отправляем.")
         return
-
+    
     text_parts = ["🏆 <b>Матчи на ближайшие 7 дней:</b>\n\n"]
     
     if manu_matches:
@@ -165,6 +145,10 @@ def send_notifications():
         text_parts.append("\n\n".join(cska_matches))
     
     text = ''.join(text_parts)
+    
+    print(f"\n=== ИТОГОВОЕ СООБЩЕНИЕ ===")
+    print(text)
+    print("=========================\n")
     
     # Отправка с parse_mode='HTML' для жирного текста
     try:
