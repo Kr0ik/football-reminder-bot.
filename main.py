@@ -9,29 +9,21 @@ TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 CHAT_ID = os.environ["CHAT_ID"]
 bot = telebot.TeleBot(TELEGRAM_TOKEN)
 
-# Teams to track
-MANU_KEYWORDS = ["манчестер юнайтед", "manchester united", "ман юнайтед", "манчестер ю."]
-CSKA_KEYWORDS = ["цска"]
-
 # Days of week in Russian
 DAYS_RU = ["Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Суббота", "Воскресенье"]
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept-Language": "ru-RU,ru;q=0.9"
 }
 
 def convert_to_jerusalem_time(time_str):
-    """Convert Moscow time (UTC+3) to Jerusalem time (UTC+2 winter / UTC+3 summer)"""
-    # championat.com shows Moscow time (UTC+3)
-    # Jerusalem is UTC+2 in winter, UTC+3 in summer
-    # For simplicity, assuming same timezone (both UTC+3 in summer, 1 hour diff in winter)
-    # In late November, Israel is on winter time (UTC+2), Moscow is UTC+3
-    # So we subtract 1 hour
+    """Convert Moscow time (UTC+3) to Jerusalem time (UTC+2 in winter)"""
     try:
+        time_str = time_str.replace('.', ':')
         if ':' in time_str:
-            hours, minutes = map(int, time_str.replace('.', ':').split(':'))
-            # Subtract 1 hour for winter time difference
-            hours = hours - 1
+            hours, minutes = map(int, time_str.split(':'))
+            hours = hours - 1  # Moscow UTC+3 to Jerusalem UTC+2 (winter)
             if hours < 0:
                 hours = 23
             return f"{hours:02d}:{minutes:02d}"
@@ -40,85 +32,62 @@ def convert_to_jerusalem_time(time_str):
     return time_str
 
 def find_matches_for_week():
-    """Find matches for the next 7 days"""
-    base_url = "https://www.championat.com/stat/"
+    """Find matches for next 7 days"""
     manu_matches = []
     cska_matches = []
     
-    # Check next 7 days
     for day_offset in range(8):
         check_date = datetime.now() + timedelta(days=day_offset)
         date_str = check_date.strftime("%Y-%m-%d")
         day_name = DAYS_RU[check_date.weekday()]
         formatted_date = check_date.strftime("%d.%m.%Y")
         
-        url = f"{base_url}#{date_str}"
+        url = f"https://www.championat.com/stat/#{date_str}"
         
         try:
-            resp = requests.get(base_url, headers=HEADERS, timeout=20, params={'date': date_str})
+            resp = requests.get("https://www.championat.com/stat/", headers=HEADERS, timeout=30)
             resp.raise_for_status()
             soup = BeautifulSoup(resp.text, 'html.parser')
+            html_lower = resp.text.lower()
             
-            # Get all text and search for matches
-            all_text = soup.get_text(separator='\n')
-            lines = all_text.split('\n')
-            
-            for i, line in enumerate(lines):
-                line_lower = line.lower().strip()
-                
-                # Check for Manchester United
-                if any(kw in line_lower for kw in MANU_KEYWORDS):
-                    # Look for time in nearby lines
-                    time_str = ""
-                    match_info = line.strip()
+            # Search for Manchester United
+            manu_patterns = ["манчестер юнайтед", "манчестер ю."]
+            for pattern in manu_patterns:
+                if pattern in html_lower:
+                    # Find all lines with time and match info
+                    matches = re.findall(r'(\d{1,2}[:\.:]\d{2})\s*([^<]{10,100}' + re.escape(pattern) + r'[^<]{0,50})', html_lower)
+                    matches += re.findall(r'(\d{1,2}[:\.:]\d{2})\s*([^<]{0,50}' + re.escape(pattern) + r'[^<]{10,100})', html_lower)
                     
-                    # Check surrounding lines for time
-                    for j in range(max(0, i-3), min(len(lines), i+3)):
-                        time_match = re.search(r'(\d{1,2}[:\.]\d{2})', lines[j])
-                        if time_match:
-                            time_str = convert_to_jerusalem_time(time_match.group(1))
-                            break
-                    
-                    # Get match context
-                    context_lines = []
-                    for j in range(max(0, i-1), min(len(lines), i+2)):
-                        if lines[j].strip() and len(lines[j].strip()) > 3:
-                            context_lines.append(lines[j].strip())
-                    
-                    match_text = ' '.join(context_lines)[:150]
-                    
-                    if match_text and time_str:
-                        entry = f"📅 {formatted_date} ({day_name})\n⏰ {time_str} (Иерусалим)\n⚽ {match_text}"
-                        if entry not in manu_matches:
+                    for time_str, match_text in matches:
+                        jerusalem_time = convert_to_jerusalem_time(time_str)
+                        clean_match = ' '.join(match_text.split())[:100]
+                        entry = f"📅 {formatted_date} ({day_name})\n⏰ {jerusalem_time} (Иерусалим)\n⚽ {clean_match.title()}"
+                        if entry not in manu_matches and "манчестер" in entry.lower():
                             manu_matches.append(entry)
+            
+            # Search for CSKA Moscow only (in context of Russian league)
+            # Look for CSKA in Russian Premier League section
+            if "российская премьер-лига" in html_lower or "мир российская" in html_lower:
+                # Only CSKA in Russian league context
+                cska_pattern = r'(\d{1,2}[:\.:]\d{2})\s*([^<]{0,50}цска[^<]{0,50})'
+                matches = re.findall(cska_pattern, html_lower)
                 
-                # Check for CSKA
-                if any(kw in line_lower for kw in CSKA_KEYWORDS):
-                    time_str = ""
-                    match_info = line.strip()
-                    
-                    for j in range(max(0, i-3), min(len(lines), i+3)):
-                        time_match = re.search(r'(\d{1,2}[:\.]\d{2})', lines[j])
-                        if time_match:
-                            time_str = convert_to_jerusalem_time(time_match.group(1))
-                            break
-                    
-                    context_lines = []
-                    for j in range(max(0, i-1), min(len(lines), i+2)):
-                        if lines[j].strip() and len(lines[j].strip()) > 3:
-                            context_lines.append(lines[j].strip())
-                    
-                    match_text = ' '.join(context_lines)[:150]
-                    
-                    if match_text and time_str:
-                        entry = f"📅 {formatted_date} ({day_name})\n⏰ {time_str} (Иерусалим)\n⚽ {match_text}"
-                        if entry not in cska_matches:
-                            cska_matches.append(entry)
+                for time_str, match_text in matches:
+                    # Exclude other CSKAs (Sofia, etc)
+                    if 'софия' in match_text.lower() or 'болгар' in match_text.lower():
+                        continue
+                    jerusalem_time = convert_to_jerusalem_time(time_str)
+                    clean_match = ' '.join(match_text.split())[:100]
+                    entry = f"📅 {formatted_date} ({day_name})\n⏰ {jerusalem_time} (Иерусалим)\n⚽ {clean_match.title()}"
+                    if entry not in cska_matches:
+                        cska_matches.append(entry)
+            
+            break  # Page contains all days
             
         except Exception as e:
             continue
     
-    return manu_matches[:5], cska_matches[:5]  # Limit to 5 matches per team
+    return manu_matches[:5], cska_matches[:5]
 
 def send_notifications():
     manu_matches, cska_matches = find_matches_for_week()
