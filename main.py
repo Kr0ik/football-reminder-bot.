@@ -12,8 +12,12 @@ CSKA_NAMES = ["ЦСКА", "CSKA"]
 
 URL = "https://www.championat.com/stat/"
 
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+}
+
 def find_matches():
-    resp = requests.get(URL, timeout=20)
+    resp = requests.get(URL, headers=HEADERS, timeout=20)
     resp.raise_for_status()
     html = resp.text
     manu_found = any(name in html for name in MANU_NAMES)
