@@ -3,13 +3,20 @@ import requests
 from bs4 import BeautifulSoup
 import telebot
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
+import locale
+
+# Попытка установить русскую локаль для дат (если система поддерживает)
+try:
+    locale.setlocale(locale.LC_ALL, 'ru_RU.UTF-8')
+except:
+    pass
 
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 CHAT_ID = os.environ["CHAT_ID"]
 bot = telebot.TeleBot(TELEGRAM_TOKEN)
 
-# URLs for team calendars on sports.ru
+# URLs
 MANU_URL = "https://www.sports.ru/football/club/mu/calendar/"
 CSKA_URL = "https://www.sports.ru/football/club/cska/calendar/"
 
@@ -18,103 +25,153 @@ HEADERS = {
     "Accept-Language": "ru-RU,ru;q=0.9"
 }
 
-def convert_to_jerusalem_time(time_str):
-    """Convert Moscow time (UTC+3) to Jerusalem time (UTC+2 in winter)"""
+def get_match_details(row_cells, year_from_url=None):
+    """
+    Извлекает данные из ячеек строки таблицы.
+    Возвращает: datetime_msk, match_title
+    """
     try:
-        time_str = time_str.replace('.', ':').strip()
-        if ':' in time_str:
-            parts = time_str.split(':')
-            hours = int(parts[0])
-            minutes = int(parts[1]) if len(parts) > 1 else 0
-            hours = hours - 1  # Moscow UTC+3 to Jerusalem UTC+2 (winter)
-            if hours < 0:
-                hours = 23
-            return f"{hours:02d}:{minutes:02d}"
-    except:
-        pass
-    return time_str
+        # 1. Дата и время (1-я колонка)
+        # Формат обычно: "30.11.2025 | 15:00" или "30.11.2025\n15:00"
+        date_text = row_cells[0].get_text(strip=True)
+        # Ищем паттерн ДД.ММ.ГГГГ и ЧЧ:ММ
+        date_match = re.search(r'(\d{2})\.(\d{2})\.(\d{4}).*?(\d{2}:\d{2})', date_text)
+        
+        if not date_match:
+            return None, None
+
+        day, month, year, time = date_match.groups()
+        dt_msk = datetime.strptime(f"{day}.{month}.{year} {time}", "%d.%m.%Y %H:%M")
+
+        # 2. Название матча (обычно в колонке "Счет" - это ссылка)
+        # Структура sports.ru: Дата | Турнир | Соперник | Счет/Превью
+        # Иногда колонок 5, иногда 4. Счет/Ссылка обычно предпоследняя или последняя.
+        
+        match_title = ""
+        
+        # Ищем ячейку со счетом/ссылкой (обычно содержит "превью" или "- : -")
+        score_cell = None
+        for cell in row_cells:
+            if '- : -' in cell.get_text() or 'превью' in cell.get_text().lower() or ':' in cell.get_text():
+                 score_cell = cell
+                 
+        # Если не нашли явную ячейку счета, берем последнюю
+        if not score_cell:
+            score_cell = row_cells[-1]
+
+        # Пытаемся достать текст ссылки (там обычно "Команда А – Команда Б")
+        link = score_cell.find('a')
+        if link:
+            match_title = link.get_text(strip=True)
+        
+        # Если ссылки нет или текст пустой, формируем из названия соперника
+        if not match_title or match_title == "- : -":
+            # Обычно соперник в 3-й колонке (индекс 2)
+            opponent = row_cells[2].get_text(strip=True)
+            match_title = f"vs {opponent}"
+
+        # Очистка названия от мусора (счета типа "- : -")
+        match_title = match_title.replace("- : -", "").strip()
+        
+        return dt_msk, match_title
+
+    except Exception as e:
+        print(f"Error parsing row: {e}")
+        return None, None
 
 def get_upcoming_matches(url, team_name):
-    """Get upcoming matches from sports.ru calendar page"""
-    matches = []
+    print(f"Загрузка {team_name}...")
     try:
-        resp = requests.get(url, headers=HEADERS, timeout=30)
-        resp.raise_for_status()
-        soup = BeautifulSoup(resp.text, 'html.parser')
+        response = requests.get(url, headers=HEADERS, timeout=10)
+        response.raise_for_status()
+        soup = BeautifulSoup(response.content, 'html.parser')
         
-        # Find match blocks - looking for upcoming matches (no score yet)
-        # Format on sports.ru: date time, teams, league
-        text = soup.get_text(separator='\n')
-        lines = text.split('\n')
+        matches = []
+        today = datetime.now()
+        week_later = today + timedelta(days=7)
+
+        # Ищем таблицу со статистикой (стандарт sports.ru)
+        table = soup.find('table', class_='stat-table')
+        if not table:
+            # Fallback: ищем любую таблицу
+            table = soup.find('table')
+
+        if not table:
+            return []
+
+        rows = table.find_all('tr')
         
-        for i, line in enumerate(lines):
-            line = line.strip()
-            # Look for date patterns like "30 ноября" or "07 декабря"
-            date_match = re.search(r'(\d{1,2})\s+(января|февраля|марта|апреля|мая|июня|июля|августа|сентября|октября|ноября|декабря)\s+(\d{1,2}:\d{2})', line)
+        for row in rows:
+            cells = row.find_all('td')
+            if len(cells) < 4: 
+                continue # Пропускаем заголовки
             
-            if date_match:
-                day = date_match.group(1)
-                month = date_match.group(2)
-                time_msk = date_match.group(3)
-                time_jer = convert_to_jerusalem_time(time_msk)
-                
-                # Look for match info in nearby lines
-                match_info = ""
-                for j in range(max(0, i-2), min(len(lines), i+5)):
-                    check_line = lines[j].strip()
-                    if ('–' in check_line or '-' in check_line) and 'лига' not in check_line.lower():
-                        if len(check_line) > 5 and len(check_line) < 100:
-                            match_info = check_line
-                            break
-                
-                if match_info:
-                    # Check if match is not completed (no score like "2 0" or "2:0")
-                    if not re.search(r'\d\s*[:–-]?\s*\d\s*$', match_info) or 'заверш' not in line.lower():
-                        entry = f"📅 {day} {month}\n⏰ {time_jer} (Иерусалим)\n⚽ {match_info}"
-                        if entry not in matches:
-                            matches.append(entry)
-        
-        # Also try to find future matches by looking for specific patterns
-        # Pattern: "Team1 – Team2" followed by date
-        all_text = soup.get_text()
-        
-        # Find patterns like "30 ноября 15:00"
-        future_matches = re.findall(r'(\d{1,2})\s+(января|февраля|марта|апреля|мая|июня|июля|августа|сентября|октября|ноября|декабря)\s+(\d{1,2}:\d{2})\s*([^\n]{10,80})', all_text)
-        
-        for day, month, time_msk, match_text in future_matches:
-            if 'заверш' not in match_text.lower():
-                time_jer = convert_to_jerusalem_time(time_msk)
-                entry = f"📅 {day} {month}\n⏰ {time_jer} (Иерусалим)\n⚽ {match_text.strip()}"
-                if entry not in matches and team_name.lower() in entry.lower():
+            # Проверяем, есть ли признак будущего матча в строке
+            row_text = row.get_text().lower()
+            is_upcoming = ('- : -' in row_text) or ('превью' in row_text)
+            
+            if not is_upcoming:
+                continue
+
+            dt_msk, match_title = get_match_details(cells)
+            
+            if dt_msk:
+                # Фильтр на 7 дней
+                if today <= dt_msk <= week_later:
+                    
+                    # КОНВЕРТАЦИЯ ВРЕМЕНИ (Москва UTC+3 -> Израиль UTC+2 зимой)
+                    # Вычитаем 1 час из datetime объекта
+                    # Это автоматически поправит дату, если время было 00:30
+                    dt_il = dt_msk - timedelta(hours=1)
+                    
+                    # Форматирование
+                    # Месяцы вручную, чтобы не зависеть от локали сервера
+                    months_ru = ['января', 'февраля', 'марта', 'апреля', 'мая', 'июня', 
+                                 'июля', 'августа', 'сентября', 'октября', 'ноября', 'декабря']
+                    
+                    day_str = dt_il.strftime("%d")
+                    month_str = months_ru[dt_il.month - 1]
+                    time_str = dt_il.strftime("%H:%M")
+                    
+                    entry = (
+                        f"📅 {day_str} {month_str}\n"
+                        f"🕐 {time_str} (Иерусалим)\n"
+                        f"⚽ {match_title}"
+                    )
                     matches.append(entry)
-        
+
+        return matches
     except Exception as e:
-        matches.append(f"Ошибка: {str(e)[:50]}")
-    
-    return matches[:5]
+        print(f"Error fetching {team_name}: {e}")
+        return []
 
 def send_notifications():
-    manu_matches = get_upcoming_matches(MANU_URL, "Манчестер")
-    cska_matches = get_upcoming_matches(CSKA_URL, "ЦСКА")
+    manu_matches = get_upcoming_matches(MANU_URL, "Manchester United")
+    cska_matches = get_upcoming_matches(CSKA_URL, "CSKA Moscow")
     
-    text_parts = ["🏆 Напоминание о матчах на неделю:\n"]
+    if not manu_matches and not cska_matches:
+        print("Матчей на неделю нет, сообщение не отправляем.")
+        return
+
+    text_parts = ["🏆 <b>Матчи на ближайшие 7 дней:</b>\n\n"]
     
-    text_parts.append("\n🔴 Манчестер Юнайтед:\n")
     if manu_matches:
-        text_parts.extend([f"{m}\n" for m in manu_matches])
-    else:
-        text_parts.append("Нет матчей на этой неделе\n")
+        text_parts.append("🔴 <b>Манчестер Юнайтед:</b>\n")
+        text_parts.append("\n\n".join(manu_matches))
+        text_parts.append("\n\n")
     
-    text_parts.append("\n🔵 ЦСКА Москва:\n")
     if cska_matches:
-        text_parts.extend([f"{m}\n" for m in cska_matches])
-    else:
-        text_parts.append("Нет матчей на этой неделе\n")
-    
-    text_parts.append("\n🔗 sports.ru")
+        text_parts.append("🔵 <b>ЦСКА Москва:</b>\n")
+        text_parts.append("\n\n".join(cska_matches))
     
     text = ''.join(text_parts)
-    print(text)
-    bot.send_message(CHAT_ID, text)
+    
+    # Отправка с parse_mode='HTML' для жирного текста
+    try:
+        bot.send_message(CHAT_ID, text, parse_mode='HTML', disable_web_page_preview=True)
+        print("Сообщение отправлено!")
+    except Exception as e:
+        print(f"Ошибка отправки Telegram: {e}")
+
 if __name__ == "__main__":
     send_notifications()
