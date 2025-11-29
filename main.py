@@ -62,7 +62,7 @@ def get_upcoming_matches(url, team_name):
                 match_info = ""
                 for j in range(max(0, i-2), min(len(lines), i+5)):
                     check_line = lines[j].strip()
-                    if '–' in check_line or '-' in check_line:
+                    if ' : ' in check_line:
                         if len(check_line) > 5 and len(check_line) < 100:
                             match_info = check_line
                             break
